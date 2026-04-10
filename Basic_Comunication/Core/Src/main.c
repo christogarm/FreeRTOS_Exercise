@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,26 +43,28 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* Definitions for UARTcommunicati */
 osThreadId_t UARTcommunicatiHandle;
 const osThreadAttr_t UARTcommunicati_attributes = {
   .name = "UARTcommunicati",
-  .priority = (osPriority_t) osPriorityAboveNormal,
+  .priority = (osPriority_t) osPriorityLow,
   .stack_size = 128 * 4
 };
 /* Definitions for readSensor */
 osThreadId_t readSensorHandle;
 const osThreadAttr_t readSensor_attributes = {
   .name = "readSensor",
-  .priority = (osPriority_t) osPriorityLow,
+  .priority = (osPriority_t) osPriorityNormal,
   .stack_size = 128 * 4
 };
 /* Definitions for dataProcessing */
 osThreadId_t dataProcessingHandle;
 const osThreadAttr_t dataProcessing_attributes = {
   .name = "dataProcessing",
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityAboveNormal,
   .stack_size = 128 * 4
 };
 /* Definitions for dataADC */
@@ -74,10 +77,10 @@ osMessageQueueId_t dataProcessHandle;
 const osMessageQueueAttr_t dataProcess_attributes = {
   .name = "dataProcess"
 };
-/* Definitions for binSempReadyData */
-osSemaphoreId_t binSempReadyDataHandle;
-const osSemaphoreAttr_t binSempReadyData_attributes = {
-  .name = "binSempReadyData"
+/* Definitions for BinSempUART2 */
+osSemaphoreId_t BinSempUART2Handle;
+const osSemaphoreAttr_t BinSempUART2_attributes = {
+  .name = "BinSempUART2"
 };
 /* USER CODE BEGIN PV */
 
@@ -86,6 +89,7 @@ const osSemaphoreAttr_t binSempReadyData_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 void UARTcomFunct(void *argument);
 void readSensorFunct(void *argument);
@@ -129,6 +133,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
@@ -142,8 +147,8 @@ int main(void)
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
-  /* creation of binSempReadyData */
-  binSempReadyDataHandle = osSemaphoreNew(1, 1, &binSempReadyData_attributes);
+  /* creation of BinSempUART2 */
+  BinSempUART2Handle = osSemaphoreNew(1, 1, &BinSempUART2_attributes);
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
@@ -158,7 +163,7 @@ int main(void)
   dataADCHandle = osMessageQueueNew (10, sizeof(uint16_t), &dataADC_attributes);
 
   /* creation of dataProcess */
-  dataProcessHandle = osMessageQueueNew (1, sizeof(float), &dataProcess_attributes);
+  dataProcessHandle = osMessageQueueNew (3, sizeof(float), &dataProcess_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -287,6 +292,25 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_3_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_3_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -326,10 +350,12 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-int _write(int file, char *ptr, int len)
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
-    return len;
+    if (huart->Instance == USART2)
+    {
+        osSemaphoreRelease(BinSempUART2Handle);
+    }
 }
 
 /* USER CODE END 4 */
@@ -345,11 +371,15 @@ void UARTcomFunct(void *argument)
 {
   /* USER CODE BEGIN 5 */
 	float data = 0;
+	static char msg[50];
   /* Infinite loop */
   for(;;)
   {
 	  osMessageQueueGet(dataProcessHandle, &data, NULL, osWaitForever);
-	  printf("Sensor Value = %d \n",(int) data);
+	  osSemaphoreAcquire(BinSempUART2Handle, osWaitForever);
+
+	  snprintf(msg, sizeof(msg), "Sensor Value = %d\r\n", (int)data);
+	  HAL_UART_Transmit_DMA(&huart2, (uint8_t*)msg, strlen(msg));
   }
   /* USER CODE END 5 */
 }
@@ -366,15 +396,19 @@ void readSensorFunct(void *argument)
   /* USER CODE BEGIN readSensorFunct */
 	uint16_t dataADC[10] = {4,6,8,5,7,
 							4,4,5,6,8};
+	uint16_t countDataError = 0;
+	uint32_t tick = osKernelGetTickCount();
+
   /* Infinite loop */
   for(;;)
   {
-	  osSemaphoreAcquire(binSempReadyDataHandle, osWaitForever);
 	  for (uint8_t var = 0; var < 10; var++) {
-		  osMessageQueuePut (dataADCHandle, &dataADC[var], 0, 0);
-		  osDelay(100);
+		  if(osMessageQueuePut (dataADCHandle, &dataADC[var], 0, 0) != osOK)
+			  countDataError++;
+
+		  tick += 100;
+		  osDelayUntil(tick);
 	  }
-	  osSemaphoreRelease(binSempReadyDataHandle);
 
   }
   /* USER CODE END readSensorFunct */
@@ -391,8 +425,6 @@ void dataProcessingFunct(void *argument)
 {
   /* USER CODE BEGIN dataProcessingFunct */
 
-	uint16_t countQueueData = 0;
-	const uint16_t capcityQueueData = osMessageQueueGetCapacity(dataADCHandle);
 	uint16_t dataADC[10] = {0};
 
 	float sensor = 0;
@@ -400,23 +432,13 @@ void dataProcessingFunct(void *argument)
   /* Infinite loop */
   for(;;)
   {
-	  osSemaphoreAcquire(binSempReadyDataHandle, osWaitForever);
-
-	  countQueueData = osMessageQueueGetCount(dataADCHandle);
-	  if(countQueueData < capcityQueueData){
-		  osSemaphoreRelease(binSempReadyDataHandle);
-		  osDelay(100);
+	  sensor = 0;
+	  for (uint8_t var = 0; var < 10; var++) {
+		  osMessageQueueGet(dataADCHandle, &dataADC[var], NULL, osWaitForever);
+		  sensor += (float) (dataADC[var]);
 	  }
-	  else{
-		  sensor = 0;
-		  for (uint8_t var = 0; var < countQueueData; var++) {
-			  osMessageQueueGet(dataADCHandle, &dataADC[var], NULL, 0);
-			  sensor += (float) (dataADC[var]);
-		  }
-		  sensor /= capcityQueueData;
-		  osSemaphoreRelease(binSempReadyDataHandle);
-		  osMessageQueuePut(dataProcessHandle, &sensor, 0, 100);
-	  }
+	  sensor /= 10;
+	  osMessageQueuePut(dataProcessHandle, &sensor, 0, osWaitForever);
   }
   /* USER CODE END dataProcessingFunct */
 }
